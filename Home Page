@@ -1,0 +1,392 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:location/location.dart' as location;
+import 'package:geocoding/geocoding.dart' as geocoding;
+import 'package:http/http.dart' as http;
+
+class MapPage extends StatefulWidget {
+  const MapPage({Key? key}) : super(key: key);
+
+  @override
+  State<MapPage> createState() => _MapPageState();
+}
+
+class _MapPageState extends State<MapPage> {
+  Completer<GoogleMapController> _googleMapController = Completer();
+  late location.Location _location;
+  location.LocationData? _currentLocation;
+  CameraPosition? _cameraPosition;
+  CameraPosition? _currentCameraPosition;
+  String? _currentAddress;
+  TextEditingController _destinedLocationController = TextEditingController();
+  Set<Polyline> _googleMapPolylines = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _location = location.Location();
+    _initializeMap();
+  }
+
+  Future<void> _initializeMap() async {
+    final hasPermission = await _checkLocationPermission();
+    if (!hasPermission) {
+      return;
+    }
+
+    final serviceEnabled = await _location.serviceEnabled();
+    if (!serviceEnabled) {
+      final serviceRequestResult = await _location.requestService();
+      if (!serviceRequestResult) {
+        return;
+      }
+    }
+
+    _currentLocation = await _location.getLocation();
+
+    _cameraPosition = CameraPosition(
+      target: LatLng(
+        _currentLocation?.latitude ?? 0.0,
+        _currentLocation?.longitude ?? 0.0,
+      ),
+      zoom: 15,
+    );
+
+    _currentCameraPosition = _cameraPosition;
+
+    _getAddressFromLocation(
+        _currentLocation?.latitude ?? 0.0, _currentLocation?.longitude ?? 0.0);
+
+    _location.onLocationChanged.listen((newLocation) {
+      setState(() {
+        _currentLocation = newLocation;
+      });
+
+      moveToPosition(LatLng(
+          _currentLocation?.latitude ?? 0.0, _currentLocation?.longitude ?? 0.0));
+      _getAddressFromLocation(
+          _currentLocation?.latitude ?? 0.0, _currentLocation?.longitude ?? 0.0);
+
+      _currentCameraPosition = CameraPosition(
+        target: LatLng(
+          _currentLocation?.latitude ?? 0.0,
+          _currentLocation?.longitude ?? 0.0,
+        ),
+        zoom: _currentCameraPosition?.zoom ?? 15.0,
+      );
+    });
+  }
+
+  Future<bool> _checkLocationPermission() async {
+    final permissionStatus = await _location.hasPermission();
+    if (permissionStatus == location.PermissionStatus.granted) {
+      return true;
+    } else if (permissionStatus == location.PermissionStatus.denied) {
+      final permissionRequestResult = await _location.requestPermission();
+      if (permissionRequestResult == location.PermissionStatus.granted) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void moveToPosition(LatLng latLng) async {
+    final GoogleMapController mapController = await _googleMapController.future;
+    mapController.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(
+          target: latLng,
+          zoom: _currentCameraPosition?.zoom ?? 15.0,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _getAddressFromLocation(double latitude, double longitude) async {
+    List<geocoding.Placemark> placemarks = await geocoding.placemarkFromCoordinates(
+        latitude, longitude);
+
+    if (placemarks.isNotEmpty) {
+      geocoding.Placemark placemark = placemarks.first;
+      String? address = placemark.street;
+      String? locality = placemark.locality;
+      String? administrativeArea = placemark.administrativeArea;
+      String? country = placemark.country;
+
+      String completeAddress = "$address, $locality, $administrativeArea, $country";
+
+      setState(() {
+        _currentAddress = completeAddress;
+      });
+    } else {
+      setState(() {
+        _currentAddress = "Address not found for the given coordinates.";
+      });
+    }
+  }
+
+  Future<void> _calculateRoute() async {
+    String destinedAddress = _destinedLocationController.text;
+    if (destinedAddress.isEmpty) {
+      // Handle case where destined location is not provided
+      return;
+    }
+
+    List<geocoding.Location> destinedLocations =
+    await geocoding.locationFromAddress(destinedAddress);
+
+    if (destinedLocations.isNotEmpty) {
+      geocoding.Location destinedLocation = destinedLocations.first;
+      double destinedLatitude = destinedLocation.latitude ?? 0.0;
+      double destinedLongitude = destinedLocation.longitude ?? 0.0;
+
+      // Get the directions as a list of LatLng points with driving mode
+      List<LatLng> routePoints = await _getDirectionsPoints(
+        LatLng(_currentLocation?.latitude ?? 0.0, _currentLocation?.longitude ?? 0.0),
+        LatLng(destinedLatitude, destinedLongitude),
+        mode: 'driving',
+      );
+
+      // Draw polyline on the map
+      _googleMapPolyline(routePoints);
+
+      // Optionally, you can zoom the camera to fit the entire route
+      _fitRouteOnMap(routePoints);
+    }
+  }
+
+  Future<List<LatLng>> _getDirectionsPoints(
+      LatLng origin, LatLng destination, {required String mode}) async {
+    String apiKey = 'YOUR_GOOGLE_MAPS_API_KEY';
+    String apiUrl = 'https://maps.googleapis.com/maps/api/directions/json';
+
+    final response = await http.get(
+      Uri.parse(
+          '$apiUrl?origin=${origin.latitude},${origin.longitude}&destination=${destination.latitude},${destination.longitude}&mode=$mode&key=$apiKey'),
+    );
+
+    if (response.statusCode == 200) {
+      final decoded = json.decode(response.body);
+
+      if (decoded["status"] == "OK") {
+        List<LatLng> points = [];
+
+        for (var step in decoded["routes"][0]["legs"][0]["steps"]) {
+          // Decode and add each point in the polyline
+          String encodedPolyline = step["polyline"]["points"];
+          List<LatLng> stepPoints = _decodePolyline(encodedPolyline);
+          points.addAll(stepPoints);
+        }
+
+        return points;
+      } else {
+        // Handle the case where the directions request was not successful
+        // You might want to display an error message on the map
+        return [];
+      }
+    } else {
+      // Handle errors in making the HTTP request
+      // You might want to display an error message on the map
+      return [];
+    }
+  }
+
+  List<LatLng> _decodePolyline(String encoded) {
+    List<LatLng> points = [];
+    int index = 0;
+    int len = encoded.length;
+    int lat = 0, lng = 0;
+
+    while (index < len) {
+      int b, shift = 0, result = 0;
+
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1F) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+
+      int dlat = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+      lat += dlat;
+
+      shift = 0;
+      result = 0;
+
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1F) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+
+      int dlng = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+      lng += dlng;
+
+      double latitude = lat / 1e5;
+      double longitude = lng / 1e5;
+      points.add(LatLng(latitude, longitude));
+    }
+
+    return points;
+  }
+
+  void _googleMapPolyline(List<LatLng> routePoints) {
+    Set<Polyline> polylines = {};
+
+    // Add a polyline with the given route points
+    polylines.add(
+      Polyline(
+        polylineId: PolylineId('route'),
+        color: Colors.blue,
+        points: routePoints,
+        width: 5,
+      ),
+    );
+
+    // Set the state to update the map
+    setState(() {
+      _googleMapPolylines = polylines;
+    });
+  }
+
+  void _fitRouteOnMap(List<LatLng> routePoints) async {
+    if (routePoints.isNotEmpty) {
+      // Calculate the bounds for the entire route
+      LatLngBounds bounds = LatLngBounds(
+        southwest: routePoints.reduce((value, element) => LatLng(
+          value.latitude < element.latitude ? value.latitude : element.latitude,
+          value.longitude < element.longitude ? value.longitude : element.longitude,
+        )),
+        northeast: routePoints.reduce((value, element) => LatLng(
+          value.latitude > element.latitude ? value.latitude : element.latitude,
+          value.longitude > element.longitude ? value.longitude : element.longitude,
+        )),
+      );
+
+      // Get the GoogleMapController
+      GoogleMapController mapController = await _googleMapController.future;
+
+      // Move camera to fit the entire route
+      mapController.animateCamera(
+        CameraUpdate.newLatLngBounds(bounds, 50.0),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: _buildBody(),
+    );
+  }
+
+  Widget _buildBody() {
+    if (_cameraPosition == null) {
+      return Center(
+        child: CircularProgressIndicator(),
+      );
+    }
+
+    return Column(
+      children: [
+        Expanded(
+          flex: 4,
+          child: _getMap(),
+        ),
+        Expanded(
+          flex: 1,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Padding(
+                padding: EdgeInsets.all(8.0),
+                child: TextField(
+                  controller: _destinedLocationController,
+                  decoration: InputDecoration(
+                    labelText: 'Destined Location',
+                    hintText: 'Enter or select the destined location',
+                  ),
+                ),
+              ),
+              ElevatedButton(
+                onPressed: _calculateRoute,
+                child: Text('Get Directions'),
+              ),
+              Text(
+                'Current Address: ${_currentAddress ?? "Fetching..."}',
+                style: TextStyle(fontSize: 16),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _getMap() {
+    Set<Marker> markers = {};
+
+    if (_currentLocation != null) {
+      double latitude = _currentLocation?.latitude ?? 0.0;
+      double longitude = _currentLocation?.longitude ?? 0.0;
+
+      markers.add(
+        Marker(
+          markerId: MarkerId('currentLocation'),
+          position: LatLng(latitude, longitude),
+          icon: BitmapDescriptor.defaultMarkerWithHue(120.0),
+        ),
+      );
+
+      _currentCameraPosition = CameraPosition(
+        target: LatLng(latitude, longitude),
+        zoom: _cameraPosition?.zoom ?? 15.0,
+      );
+    }
+
+    return GestureDetector(
+      onScaleUpdate: (details) {
+        // Handle scaling (zooming) gestures
+        // Use details.scale to get the scale factor
+        // You can then update the camera position accordingly
+        // For example, you can set _currentCameraPosition.zoom = initialZoom * details.scale
+        _updateCameraZoom(details.scale);
+      },
+      child: GoogleMap(
+        initialCameraPosition: _cameraPosition!,
+        mapType: MapType.normal,
+        onMapCreated: (GoogleMapController controller) {
+          if (!_googleMapController.isCompleted) {
+            _googleMapController.complete(controller);
+          }
+        },
+        markers: markers,
+        polylines: _googleMapPolylines,
+        minMaxZoomPreference: MinMaxZoomPreference(
+          15,
+          null,
+        ),
+      ),
+    );
+  }
+  Future<void> _updateCameraZoom(double scale) async {
+    final GoogleMapController? mapController = await _googleMapController.future;
+    CameraPosition currentCameraPosition = _currentCameraPosition ?? _cameraPosition!;
+    mapController?.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(
+          target: currentCameraPosition.target,
+          zoom: currentCameraPosition.zoom + scale,
+        ),
+      ),
+    );
+
+    setState(() {
+      _currentCameraPosition = CameraPosition(
+        target: currentCameraPosition.target,
+        zoom: currentCameraPosition.zoom + scale,
+      );
+    });
+  }
+}
